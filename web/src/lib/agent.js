@@ -9,13 +9,22 @@ import {
 import { tools } from "./tools";
 
 // ---------- חיבור ל-Groq דרך API תואם OpenAI ----------
-const client = new OpenAI({
-  apiKey: process.env.GROQ_API_KEY,
-  baseURL: "https://api.groq.com/openai/v1",
-});
-setDefaultOpenAIClient(client);
-setOpenAIAPI("chat_completions");
-setTracingDisabled(true);
+// נוצר רק בפעם הראשונה שמפעילים חקירה — לא בזמן build, כשאין עדיין מפתח
+let clientReady = false;
+function setupClient() {
+  if (clientReady) return;
+  if (!process.env.GROQ_API_KEY) {
+    throw new Error("GROQ_API_KEY is not set");
+  }
+  const client = new OpenAI({
+    apiKey: process.env.GROQ_API_KEY,
+    baseURL: "https://api.groq.com/openai/v1",
+  });
+  setDefaultOpenAIClient(client);
+  setOpenAIAPI("chat_completions");
+  setTracingDisabled(true);
+  clientReady = true;
+}
 
 const MODEL = process.env.MODEL || "openai/gpt-oss-120b";
 
@@ -98,6 +107,8 @@ function parseJson(text, fallback) {
 
 // ---------- הפעלת החקירה: שני סוכנים ברצף ----------
 export async function investigate() {
+  setupClient(); // יוצר את החיבור ל-Groq בפעם הראשונה בלבד
+
   // שלב 1: החוקר מפעיל כלים ואוסף ראיות
   const investigation = await run(
     investigator,
@@ -128,7 +139,7 @@ export async function investigate() {
     reasoning: "",
   });
 
-  // מאחדים לדוח אחד, באותו מבנה שהדף כבר מכיר, ועוד שדות
+  // מאחדים לדוח אחד
   return {
     report: { ...findings, ...decision },
     toolsUsed,
