@@ -139,6 +139,10 @@ app.get("/logs", (req, res) => {
   res.json(logs.slice(-limit));
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, (err) => {
+  if (err) {
+    console.error(`Failed to start on port ${PORT}: ${err.message}`);
+    process.exit(1);
+  }
   log("info", `Orders service v${VERSION} listening on port ${PORT}`);
 });
