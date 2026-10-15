@@ -1,5 +1,7 @@
-import "dotenv/config";
+import { config } from "dotenv";
+config({ path: ".env.local" }); // dotenv טוען ברירת מחדל רק .env — אומרים לו במפורש איזה קובץ
 import express from "express";
+import { MongoClient } from "mongodb";
 
 const app = express();
 app.use(express.json());
@@ -19,22 +21,39 @@ function log(level, message) {
   console.log(`[${entry.time}] ${level.toUpperCase()} ${message}`);
 }
 
-// ===== "מסד נתונים" פשוט בזיכרון =====
-const db = {
-  connected: SCENARIO !== "db_down",
-  orders: [
-    { id: 1, item: "Laptop", price: 4500, status: "paid" },
-    { id: 2, item: "Mouse", price: 120, status: "pending" },
-  ],
-};
+// ===== MongoDB =====
+let MONGO_URL = process.env.MONGO_URL;
 
-function queryOrders() {
-  if (!db.connected) {
-    throw new Error(
-      "ECONNREFUSED 10.0.0.5:5432 - could not connect to orders-db",
-    );
+// תקלה: "קונפיגורציה שגויה" — השירות מנסה להתחבר לשרת DB שלא קיים
+if (SCENARIO === "db_down") {
+  MONGO_URL = "mongodb://orders-db.internal:27017/orders";
+}
+
+if (!MONGO_URL) {
+  console.error("MONGO_URL is not set. Add it to service/.env.local");
+  process.exit(1);
+}
+
+// serverSelectionTimeoutMS: אם אין חיבור תוך 3 שניות — נכשלים מהר במקום לחכות 30 שניות
+const client = new MongoClient(MONGO_URL, { serverSelectionTimeoutMS: 3000 });
+const db = client.db("orders");
+const ordersCol = db.collection("orders");
+
+// הזמנות התחלתיות, רק אם האוסף ריק
+async function seedOrders() {
+  try {
+    const count = await ordersCol.countDocuments();
+    if (count === 0) {
+      await ordersCol.insertMany([
+        { id: 1, item: "Laptop", price: 4500, status: "paid" },
+        { id: 2, item: "Mouse", price: 120, status: "pending" },
+      ]);
+      log("info", "Seeded orders collection with 2 orders");
+    }
+    log("info", "Connected to MongoDB");
+  } catch (err) {
+    log("error", `MongoDB connection failed: ${err.name}: ${err.message}`);
   }
-  return db.orders;
 }
 
 // ===== ספק תשלומים חיצוני מדומה =====
@@ -67,11 +86,15 @@ app.use(async (req, res, next) => {
 });
 
 // ===== API של ההזמנות =====
-app.get("/api/orders", (req, res) => {
+app.get("/api/orders", async (req, res) => {
   try {
-    res.json(queryOrders());
+    // projection: לא מחזירים את _id הפנימי של Mongo
+    const orders = await ordersCol
+      .find({}, { projection: { _id: 0 } })
+      .toArray();
+    res.json(orders);
   } catch (err) {
-    log("error", `GET /api/orders failed: ${err.message}`);
+    log("error", `GET /api/orders failed: ${err.name}: ${err.message}`);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -84,8 +107,6 @@ app.post("/api/orders", async (req, res) => {
   }
 
   try {
-    const orders = queryOrders();
-
     // פיצ'ר חדש בגרסה 1.1.0: קופון הנחה (עם באג - מניח שתמיד נשלח coupon)
     if (VERSION === "1.1.0") {
       const discount = req.body.coupon.code === "SALE10" ? 0.1 : 0;
@@ -93,8 +114,11 @@ app.post("/api/orders", async (req, res) => {
 
     await checkPaymentProvider(); // יצירת הזמנה דורשת את ספק התשלומים
 
-    const order = { id: orders.length + 1, item, price, status: "pending" };
-    orders.push(order);
+    const count = await ordersCol.countDocuments();
+    const order = { id: count + 1, item, price, status: "pending" };
+    await ordersCol.insertOne(order);
+    delete order._id; // insertOne מוסיף _id לאובייקט — לא מחזירים אותו
+
     log("info", `Order ${order.id} created`);
     res.status(201).json(order);
   } catch (err) {
@@ -105,11 +129,20 @@ app.post("/api/orders", async (req, res) => {
 
 // ===== נקודות הקצה שהסוכן ישתמש בהן =====
 app.get("/health", async (req, res) => {
-  const checks = {
-    database: db.connected ? "ok" : "down",
-    paymentProvider: "ok",
-  };
-  if (!db.connected) log("error", "Health check: database unreachable");
+  const checks = { database: "ok", paymentProvider: "ok" };
+  let databaseLatencyMs = null;
+
+  const t0 = Date.now();
+  try {
+    await db.command({ ping: 1 }); // ping אמיתי למסד הנתונים
+    databaseLatencyMs = Date.now() - t0;
+  } catch (err) {
+    checks.database = "down";
+    log(
+      "error",
+      `Health check: database unreachable - ${err.name}: ${err.message}`,
+    );
+  }
 
   try {
     await checkPaymentProvider();
@@ -123,6 +156,7 @@ app.get("/health", async (req, res) => {
     status: allOk ? "ok" : "degraded",
     uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
     checks,
+    databaseLatencyMs,
   });
 });
 
@@ -145,4 +179,5 @@ app.listen(PORT, (err) => {
     process.exit(1);
   }
   log("info", `Orders service v${VERSION} listening on port ${PORT}`);
+  seedOrders();
 });
